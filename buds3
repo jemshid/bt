@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# Control the "OnePlus Buds 3" Bluetooth headset: connect (A2DP-SBC-XQ or
+# HSP/HFP-mSBC), disconnect, or show status.
+set -uo pipefail
+
+DEVICE_NAME="OnePlus Buds 3"
+MAC=""
+CARD=""
+
+A2DP_PROFILE="a2dp-sink-sbc_xq"
+HFP_PROFILE="headset-head-unit-msbc"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/buds3"
+STATE_FILE="$STATE_DIR/prev_defaults"
+
+# ---- colors ----------------------------------------------------------
+c_reset=$'\e[0m'; c_bold=$'\e[1m'; c_green=$'\e[32m'; c_yellow=$'\e[33m'
+c_red=$'\e[31m'; c_blue=$'\e[34m'; c_dim=$'\e[2m'
+info()  { echo "${c_blue}==>${c_reset} $*"; }
+ok()    { echo "${c_green}✓${c_reset} $*"; }
+warn()  { echo "${c_yellow}!${c_reset} $*"; }
+err()   { echo "${c_red}✗${c_reset} $*" >&2; }
+
+# ---- discovery ---------------------------------------------------------
+resolve_device() {
+    MAC=$(bluetoothctl devices Paired | grep -F "$DEVICE_NAME" | awk '{print $2}' | head -n1)
+    if [[ -z "$MAC" ]]; then
+        err "\"$DEVICE_NAME\" is not paired. Pair it first with: bluetoothctl"
+        exit 1
+    fi
+    CARD="bluez_card.${MAC//:/_}"
+}
+
+is_bt_connected() {
+    bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"
+}
+
+active_profile() {
+    pactl list cards 2>/dev/null | awk -v card="$CARD" '
+        $0 ~ "Name: " card {f=1}
+        f && /Active Profile:/ {print $3; exit}
+    '
+}
+
+profile_label() {
+    case "$1" in
+        "$A2DP_PROFILE")   echo "A2DP Sink (SBC-XQ)" ;;
+        "$HFP_PROFILE")    echo "HSP/HFP (mSBC)" ;;
+        headset-head-unit-cvsd) echo "HSP/HFP (CVSD - mSBC unavailable)" ;;
+        headset-head-unit) echo "HSP/HFP (negotiating codec)" ;;
+        a2dp-sink)         echo "A2DP Sink (SBC)" ;;
+        off|"")            echo "off" ;;
+        *)                 echo "$1" ;;
+    esac
+}
+
+card_exists() { pactl list cards short 2>/dev/null | grep -q "$CARD"; }
+
+bt_sink_name()   { pactl list sinks short 2>/dev/null   | awk -v m="bluez_output.${MAC//:/_}." '$2 ~ "^"m {print $2; exit}'; }
+bt_source_name() { pactl list sources short 2>/dev/null | awk -v m="bluez_input.${MAC//:/_}." '$2 ~ "^"m {print $2; exit}'; }
+
+sink_exists()   { pactl list sinks short 2>/dev/null   | awk '{print $2}' | grep -qxF "$1"; }
+source_exists() { pactl list sources short 2>/dev/null | awk '{print $2}' | grep -qxF "$1"; }
+
+default_sink()   { pactl get-default-sink 2>/dev/null; }
+default_source() { pactl get-default-source 2>/dev/null; }
+
+# Remember the non-Bluetooth default sink/source so disconnect can restore
+# them. Only captures once (won't overwrite a saved value with a bluez one
+# when switching modes while already connected).
+save_prev_defaults() {
+    [[ -f "$STATE_FILE" ]] && return
+    local s src
+    s=$(default_sink); src=$(default_source)
+    [[ "$s" == bluez_* || "$src" == bluez_* ]] && return
+    mkdir -p "$STATE_DIR"
+    printf 'SINK=%q\nSOURCE=%q\n' "$s" "$src" >"$STATE_FILE"
+}
+
+apply_audio_defaults() {
+    local bt_sink bt_source
+    bt_sink=$(bt_sink_name)
+    if [[ -n "$bt_sink" ]]; then
+        pactl set-default-sink "$bt_sink" >/dev/null 2>&1
+        ok "Default output -> $bt_sink"
+    fi
+
+    bt_source=$(bt_source_name)
+    if [[ -n "$bt_source" ]]; then
+        pactl set-default-source "$bt_source" >/dev/null 2>&1
+        ok "Default input -> $bt_source"
+    elif [[ -f "$STATE_FILE" ]]; then
+        # This mode has no mic (e.g. A2DP): fall back to the previously
+        # saved non-Bluetooth source instead of leaving a stale bt source set.
+        local prev_src
+        prev_src=$(source "$STATE_FILE" 2>/dev/null; echo "$SOURCE")
+        if [[ -n "$prev_src" ]] && source_exists "$prev_src"; then
+            pactl set-default-source "$prev_src" >/dev/null 2>&1
+            ok "Default input -> $prev_src (no mic in this mode)"
+        fi
+    fi
+}
+
+restore_audio_defaults() {
+    [[ -f "$STATE_FILE" ]] || return
+    local prev_sink prev_src
+    prev_sink=$(source "$STATE_FILE" 2>/dev/null; echo "$SINK")
+    prev_src=$(source "$STATE_FILE" 2>/dev/null; echo "$SOURCE")
+    if [[ -n "$prev_sink" ]] && sink_exists "$prev_sink"; then
+        pactl set-default-sink "$prev_sink" >/dev/null 2>&1
+        ok "Default output -> $prev_sink"
+    fi
+    if [[ -n "$prev_src" ]] && source_exists "$prev_src"; then
+        pactl set-default-source "$prev_src" >/dev/null 2>&1
+        ok "Default input -> $prev_src"
+    fi
+    rm -f "$STATE_FILE"
+}
+
+wait_for() { # wait_for <check_cmd...> <timeout_s>
+    local timeout=$1; shift
+    local waited=0
+    while (( waited < timeout )); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+print_status() {
+    resolve_device
+    echo "${c_bold}OnePlus Buds 3${c_reset} (${c_dim}$MAC${c_reset})"
+    if is_bt_connected; then
+        ok "Bluetooth: connected"
+        if card_exists; then
+            local prof
+            prof=$(active_profile)
+            echo "  Mode: ${c_bold}$(profile_label "$prof")${c_reset}"
+        else
+            warn "  Audio card not yet available"
+        fi
+    else
+        echo "  Bluetooth: ${c_dim}disconnected${c_reset}"
+    fi
+    echo "  Default output: ${c_dim}$(default_sink)${c_reset}"
+    echo "  Default input:  ${c_dim}$(default_source)${c_reset}"
+}
+
+# ---- actions -------------------------------------------------------------
+do_connect() {
+    local target_profile="$1" label="$2"
+    resolve_device
+
+    info "Current status:"
+    print_status
+    echo
+
+    save_prev_defaults
+
+    if ! is_bt_connected; then
+        info "Connecting to $DEVICE_NAME..."
+        bluetoothctl connect "$MAC" >/dev/null
+        if ! wait_for 10 is_bt_connected; then
+            err "Failed to connect to $DEVICE_NAME"
+            exit 1
+        fi
+        ok "Bluetooth connected"
+    else
+        ok "Already connected"
+    fi
+
+    info "Waiting for audio card..."
+    if ! wait_for 10 card_exists; then
+        err "Audio card for $DEVICE_NAME never appeared"
+        exit 1
+    fi
+
+    local current
+    current=$(active_profile)
+    if [[ "$current" == "$target_profile" ]]; then
+        ok "Already in $label mode"
+    else
+        info "Switching to $label..."
+        if ! pactl set-card-profile "$CARD" "$target_profile" 2>/tmp/buds3-err; then
+            err "Failed to set profile: $(cat /tmp/buds3-err)"
+            exit 1
+        fi
+        sleep 1
+        local newp
+        newp=$(active_profile)
+        if [[ "$newp" == "$target_profile" ]]; then
+            ok "Now in $(profile_label "$newp") mode"
+        else
+            warn "Requested $label but device is in $(profile_label "$newp") (device/codec may not support it right now)"
+        fi
+    fi
+
+    info "Updating default output/input..."
+    local waited=0
+    while [[ -z "$(bt_sink_name)" && $waited -lt 10 ]]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    apply_audio_defaults
+
+    echo
+    info "Final status:"
+    print_status
+}
+
+do_disconnect() {
+    resolve_device
+    info "Current status:"
+    print_status
+    echo
+
+    if ! is_bt_connected; then
+        ok "Already disconnected"
+        return
+    fi
+
+    info "Disconnecting $DEVICE_NAME..."
+    bluetoothctl disconnect "$MAC" >/dev/null
+    if wait_for 10 bash -c "! bluetoothctl info '$MAC' | grep -q 'Connected: yes'"; then
+        ok "Disconnected"
+    else
+        err "Failed to disconnect"
+        exit 1
+    fi
+
+    info "Restoring default output/input..."
+    restore_audio_defaults
+
+    # bluetoothctl can briefly flicker back to "Connected: yes" right after
+    # disconnecting; let it settle before showing final status.
+    sleep 1
+
+    echo
+    info "Final status:"
+    print_status
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <command>
+
+Commands:
+  a2dp, music        Connect in A2DP Sink mode (codec SBC-XQ)
+  hfp, call          Connect in HSP/HFP mode (codec mSBC)
+  disconnect, off     Disconnect the headset
+  status              Show current connection/mode
+
+EOF
+}
+
+case "${1:-}" in
+    a2dp|music)      do_connect "$A2DP_PROFILE" "A2DP Sink (SBC-XQ)" ;;
+    hfp|call)        do_connect "$HFP_PROFILE" "HSP/HFP (mSBC)" ;;
+    disconnect|off)  do_disconnect ;;
+    status)          print_status ;;
+    *)               usage; exit 1 ;;
+esac
