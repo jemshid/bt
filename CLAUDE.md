@@ -4,19 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`buds3` is a single self-contained bash script (no build system, package manager,
-or test suite) that controls a Bluetooth headset on Linux via BlueZ
-(`bluetoothctl`) and PipeWire/PulseAudio (`pactl`). It was written for the
-OnePlus Buds 3 but works with any headset exposing the same profile names.
+`bt` is a single self-contained bash script (no build system, package manager,
+or test suite) that lists and controls Bluetooth audio devices on Linux via
+BlueZ (`bluetoothctl`) and PipeWire/PulseAudio (`pactl`). Any paired device is
+selected by name on the command line; it was originally written for the OnePlus
+Buds 3 but is device-agnostic and auto-selects the best codec profile each
+device exposes.
 
 ## Development
 
 There is no build, lint, or test tooling in this repo. Useful checks:
 
 ```bash
-shellcheck buds3        # static analysis (if installed)
-bash -n buds3           # syntax check
-./buds3 status          # exercise against a real paired device
+shellcheck bt           # static analysis (if installed)
+bash -n bt              # syntax check
+./bt                    # list devices (safe; needs only paired devices)
+./bt <name> status      # exercise against a real paired device
 ```
 
 Manual testing requires an actual paired Bluetooth headset — behavior can't be
@@ -25,31 +28,42 @@ depends on live device/audio-card state.
 
 ## Architecture
 
-The whole script (`buds3`) is organized in layers, top to bottom:
+The whole script (`bt`) is organized in layers, top to bottom:
 
-- **Config constants**: `DEVICE_NAME`, `A2DP_PROFILE`, `HFP_PROFILE` — the
-  only values a user typically needs to change to target a different headset.
-- **Discovery helpers**: `resolve_device` looks up the MAC address from
-  `bluetoothctl devices Paired` and derives the PipeWire card name
-  (`bluez_card.<MAC_with_underscores>`). Nearly every other function depends
-  on `MAC`/`CARD` being set first via `resolve_device`.
+- **Discovery helpers**: `list_devices` emits `<MAC>\t<Name>` for every known
+  device (from `bluetoothctl devices`). `resolve_device <query>` matches the
+  query case-insensitively as a substring of the name (or exact MAC), erroring
+  on no match and on ambiguity (unless an exact full-name match disambiguates);
+  it sets the globals `MAC`, `DEVICE_NAME`, `CARD`
+  (`bluez_card.<MAC_with_underscores>`), and the per-device `STATE_FILE`.
+  Nearly every other function depends on these being set first.
+- **Profile selection**: there are no hardcoded profile constants.
+  `available_profiles` parses the card's `Profiles:` block for currently
+  `available: yes` profile names; `pick_profile <a2dp|hfp>` chooses the best
+  one from a per-kind preference list (e.g. a2dp: sbc_xq > ldac > aptx_hd >
+  aptx > aac > plain), falling back to any profile matching `^a2dp-sink` /
+  `^headset`. This is what makes the script device-agnostic.
 - **State query helpers**: `is_bt_connected`, `active_profile`, `card_exists`,
   `bt_sink_name`/`bt_source_name`, `sink_exists`/`source_exists`,
   `default_sink`/`default_source` — all thin wrappers around `bluetoothctl`/
   `pactl` output parsing (mostly `awk`).
 - **Default sink/source persistence**: `save_prev_defaults` snapshots the
   current non-Bluetooth default sink/source to
-  `$XDG_STATE_HOME/buds3/prev_defaults` (only once — it won't overwrite a
-  saved value with a bluez default when switching modes while connected).
-  `apply_audio_defaults` points defaults at the bluez sink/source once
-  connected (falling back to the saved non-bt source when the mode has no
+  `$XDG_STATE_HOME/bt/prev_defaults.<MAC>` (per device, only once — it won't
+  overwrite a saved value with a bluez default when switching modes while
+  connected). `apply_audio_defaults` points defaults at the bluez sink/source
+  once connected (falling back to the saved non-bt source when the mode has no
   mic, e.g. A2DP). `restore_audio_defaults` puts the saved defaults back on
   disconnect and clears the state file.
-- **Actions**: `do_connect <profile> <label>`, `do_disconnect`, and
-  `print_status` compose the helpers above into the full command flow, each
-  printing a "current status" / progress / "final status" sequence.
-- **Dispatch**: a `case` on `$1` at the bottom maps CLI subcommands
-  (`a2dp`/`music`, `hfp`/`call`, `disconnect`/`off`, `status`) to the actions.
+- **Actions**: `do_list` prints all known devices with a connection marker;
+  `do_connect <a2dp|hfp> <label>` (resolves the concrete profile via
+  `pick_profile`), `do_disconnect`, and `print_status` compose the helpers
+  above into the full command flow, each printing a "current status" /
+  progress / "final status" sequence.
+- **Dispatch**: a `case` on `$1` at the bottom routes the no-arg/`list` form to
+  `do_list` and otherwise treats `$1` as the device query (via
+  `resolve_device`) and `$2` as the action (`a2dp`/`music`, `hfp`/`call`,
+  `disconnect`/`off`, `status`; defaulting to `status`).
 
 Key invariants:
 - Mode switching (`pactl set-card-profile`) is used instead of a full

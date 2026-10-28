@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# bt: list Bluetooth devices, or control one by number/name:
+#   bt                       list known devices (numbered, with connection state)
+#   bt <dev> a2dp|music      connect in A2DP Sink mode (best SBC-XQ/AAC/... profile)
+#   bt <dev> hfp|call        connect in HSP/HFP mode (best mSBC/CVSD profile)
+#   bt <dev> disconnect|off  disconnect the device
+#   bt <dev> status          show current connection/mode (default action)
+#
+# <dev> is the list number (e.g. 2), or a case-insensitive substring of the
+# device name (or its MAC). Works with any headset/speaker exposing standard
+# BlueZ/PipeWire profiles.
+set -uo pipefail
+
+MAC=""
+DEVICE_NAME=""
+CARD=""
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bt"
+STATE_FILE=""   # set per-device by resolve_device
+
+# ---- colors ----------------------------------------------------------
+c_reset=$'\e[0m'; c_bold=$'\e[1m'; c_green=$'\e[32m'; c_yellow=$'\e[33m'
+c_red=$'\e[31m'; c_blue=$'\e[34m'; c_dim=$'\e[2m'
+info()  { echo "${c_blue}==>${c_reset} $*"; }
+ok()    { echo "${c_green}✓${c_reset} $*"; }
+warn()  { echo "${c_yellow}!${c_reset} $*"; }
+err()   { echo "${c_red}✗${c_reset} $*" >&2; }
+
+# ---- discovery ---------------------------------------------------------
+# Emit "<MAC>\t<Name>" for every known device, one per line, sorted by name
+# (case-insensitive) so the list order — and therefore the index numbers used
+# to select a device — is stable across invocations.
+list_devices() {
+    bluetoothctl devices | while IFS= read -r line; do
+        [[ "$line" == Device\ * ]] || continue
+        local rest=${line#Device }
+        printf '%s\t%s\n' "${rest%% *}" "${rest#* }"
+    done | sort -t$'\t' -k2,2 -f
+}
+
+# resolve_device <query>: set MAC/DEVICE_NAME/CARD/STATE_FILE. <query> is either
+# a 1-based index into the listed devices, or a case-insensitive substring of
+# the name (or exact MAC). Exits on no/out-of-range/ambiguous match.
+resolve_device() {
+    local query="$1" mac name i
+    local -a all_macs=() all_names=()
+    while IFS=$'\t' read -r mac name; do
+        all_macs+=("$mac"); all_names+=("$name")
+    done < <(list_devices)
+
+    if (( ${#all_macs[@]} == 0 )); then
+        err "No paired/known devices. Pair one first with: bluetoothctl"
+        exit 1
+    fi
+
+    if [[ "$query" =~ ^[0-9]+$ ]]; then
+        # Numeric query -> index into the stable, name-sorted list.
+        local idx=$((query - 1))
+        if (( idx < 0 || idx >= ${#all_macs[@]} )); then
+            err "No device #$query (there are ${#all_macs[@]}). Run '$(basename "$0")' to list."
+            exit 1
+        fi
+        MAC="${all_macs[idx]}"
+        DEVICE_NAME="${all_names[idx]}"
+    else
+        local -a macs=() names=()
+        for i in "${!all_macs[@]}"; do
+            if [[ "${all_macs[i],,}" == "${query,,}" ]] || [[ "${all_names[i],,}" == *"${query,,}"* ]]; then
+                macs+=("${all_macs[i]}"); names+=("${all_names[i]}")
+            fi
+        done
+        if (( ${#macs[@]} == 0 )); then
+            err "No paired/known device matches \"$query\". Run '$(basename "$0")' to list."
+            exit 1
+        fi
+        if (( ${#macs[@]} > 1 )); then
+            # An exact (case-insensitive) full-name match disambiguates.
+            local hit=-1
+            for i in "${!names[@]}"; do
+                [[ "${names[i],,}" == "${query,,}" ]] && hit=$i
+            done
+            if (( hit < 0 )); then
+                err "\"$query\" is ambiguous; matches:"
+                for i in "${!names[@]}"; do err "    ${names[i]}  (${macs[i]})"; done
+                exit 1
+            fi
+            macs=("${macs[hit]}"); names=("${names[hit]}")
+        fi
+        MAC="${macs[0]}"
+        DEVICE_NAME="${names[0]}"
+    fi
+
+    CARD="bluez_card.${MAC//:/_}"
+    STATE_FILE="$STATE_DIR/prev_defaults.${MAC//:/_}"
+}
+
+is_bt_connected() {
+    bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"
+}
+
+active_profile() {
+    pactl list cards 2>/dev/null | awk -v card="$CARD" '
+        $0 ~ "Name: " card {f=1}
+        f && /Active Profile:/ {print $3; exit}
+    '
+}
+
+# All currently-available profile names for $CARD, one per line.
+available_profiles() {
+    pactl list cards 2>/dev/null | awk -v card="$CARD" '
+        $0 ~ "Name: " card {incard=1}
+        incard && /^[[:space:]]*Profiles:/ {inprof=1; next}
+        incard && /^[[:space:]]*Active Profile:/ {exit}
+        inprof && /available: yes/ { name=$1; sub(/:$/,"",name); print name }
+    '
+}
+
+# pick_profile <a2dp|hfp>: choose the best available profile of that kind.
+pick_profile() {
+    local kind="$1" avail p pat
+    avail=$(available_profiles)
+    local -a prefs
+    case "$kind" in
+        a2dp) prefs=(a2dp-sink-sbc_xq a2dp-sink-ldac a2dp-sink-aptx_hd a2dp-sink-aptx a2dp-sink-aac a2dp-sink) ; pat='^a2dp-sink' ;;
+        hfp)  prefs=(headset-head-unit-msbc headset-head-unit-cvsd headset-head-unit) ; pat='^headset' ;;
+    esac
+    for p in "${prefs[@]}"; do
+        grep -qxF "$p" <<<"$avail" && { echo "$p"; return 0; }
+    done
+    grep -m1 -E "$pat" <<<"$avail" && return 0   # fall back to any matching profile
+    return 1
+}
+
+profile_label() {
+    case "$1" in
+        a2dp-sink-sbc_xq)       echo "A2DP Sink (SBC-XQ)" ;;
+        a2dp-sink-ldac)         echo "A2DP Sink (LDAC)" ;;
+        a2dp-sink-aac)          echo "A2DP Sink (AAC)" ;;
+        a2dp-sink-aptx_hd)      echo "A2DP Sink (aptX HD)" ;;
+        a2dp-sink-aptx)         echo "A2DP Sink (aptX)" ;;
+        a2dp-sink)              echo "A2DP Sink (SBC)" ;;
+        headset-head-unit-msbc) echo "HSP/HFP (mSBC)" ;;
+        headset-head-unit-cvsd) echo "HSP/HFP (CVSD)" ;;
+        headset-head-unit)      echo "HSP/HFP (negotiating codec)" ;;
+        off|"")                 echo "off" ;;
+        *)                      echo "$1" ;;
+    esac
+}
+
+card_exists() { pactl list cards short 2>/dev/null | grep -q "$CARD"; }
+
+bt_sink_name()   { pactl list sinks short 2>/dev/null   | awk -v m="bluez_output.${MAC//:/_}." '$2 ~ "^"m {print $2; exit}'; }
+bt_source_name() { pactl list sources short 2>/dev/null | awk -v m="bluez_input.${MAC//:/_}." '$2 ~ "^"m {print $2; exit}'; }
+
+sink_exists()   { pactl list sinks short 2>/dev/null   | awk '{print $2}' | grep -qxF "$1"; }
+source_exists() { pactl list sources short 2>/dev/null | awk '{print $2}' | grep -qxF "$1"; }
+
+default_sink()   { pactl get-default-sink 2>/dev/null; }
+default_source() { pactl get-default-source 2>/dev/null; }
+
+# Remember the non-Bluetooth default sink/source so disconnect can restore
+# them. Only captures once (won't overwrite a saved value with a bluez one
+# when switching modes while already connected).
+save_prev_defaults() {
+    [[ -f "$STATE_FILE" ]] && return
+    local s src
+    s=$(default_sink); src=$(default_source)
+    [[ "$s" == bluez_* || "$src" == bluez_* ]] && return
+    mkdir -p "$STATE_DIR"
+    printf 'SINK=%q\nSOURCE=%q\n' "$s" "$src" >"$STATE_FILE"
+}
+
+apply_audio_defaults() {
+    local bt_sink bt_source
+    bt_sink=$(bt_sink_name)
+    if [[ -n "$bt_sink" ]]; then
+        pactl set-default-sink "$bt_sink" >/dev/null 2>&1
+        ok "Default output -> $bt_sink"
+    fi
+
+    bt_source=$(bt_source_name)
+    if [[ -n "$bt_source" ]]; then
+        pactl set-default-source "$bt_source" >/dev/null 2>&1
+        ok "Default input -> $bt_source"
+    elif [[ -f "$STATE_FILE" ]]; then
+        # This mode has no mic (e.g. A2DP): fall back to the previously
+        # saved non-Bluetooth source instead of leaving a stale bt source set.
+        local prev_src
+        prev_src=$(source "$STATE_FILE" 2>/dev/null; echo "$SOURCE")
+        if [[ -n "$prev_src" ]] && source_exists "$prev_src"; then
+            pactl set-default-source "$prev_src" >/dev/null 2>&1
+            ok "Default input -> $prev_src (no mic in this mode)"
+        fi
+    fi
+}
+
+restore_audio_defaults() {
+    [[ -f "$STATE_FILE" ]] || return
+    local prev_sink prev_src
+    prev_sink=$(source "$STATE_FILE" 2>/dev/null; echo "$SINK")
+    prev_src=$(source "$STATE_FILE" 2>/dev/null; echo "$SOURCE")
+    if [[ -n "$prev_sink" ]] && sink_exists "$prev_sink"; then
+        pactl set-default-sink "$prev_sink" >/dev/null 2>&1
+        ok "Default output -> $prev_sink"
+    fi
+    if [[ -n "$prev_src" ]] && source_exists "$prev_src"; then
+        pactl set-default-source "$prev_src" >/dev/null 2>&1
+        ok "Default input -> $prev_src"
+    fi
+    rm -f "$STATE_FILE"
+}
+
+wait_for() { # wait_for <timeout_s> <check_cmd...>
+    local timeout=$1; shift
+    local waited=0
+    while (( waited < timeout )); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+print_status() {
+    echo "${c_bold}$DEVICE_NAME${c_reset} (${c_dim}$MAC${c_reset})"
+    if is_bt_connected; then
+        ok "Bluetooth: connected"
+        if card_exists; then
+            local prof
+            prof=$(active_profile)
+            echo "  Mode: ${c_bold}$(profile_label "$prof")${c_reset}"
+        else
+            warn "  Audio card not yet available"
+        fi
+    else
+        echo "  Bluetooth: ${c_dim}disconnected${c_reset}"
+    fi
+    echo "  Default output: ${c_dim}$(default_sink)${c_reset}"
+    echo "  Default input:  ${c_dim}$(default_source)${c_reset}"
+}
+
+# ---- actions -------------------------------------------------------------
+do_list() {
+    echo "${c_bold}Known Bluetooth devices:${c_reset}"
+    local i=0 mac name mark
+    while IFS=$'\t' read -r mac name; do
+        i=$((i + 1))
+        if bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes"; then
+            mark="${c_green}●${c_reset}"
+        else
+            mark="${c_dim}○${c_reset}"
+        fi
+        printf '  %2d) %b %-28s %b%s%b\n' "$i" "$mark" "$name" "$c_dim" "$mac" "$c_reset"
+    done < <(list_devices)
+    (( i )) || warn "No paired/known devices. Pair one first with: bluetoothctl"
+    echo
+    echo "${c_dim}Control one with: $(basename "$0") <number|name> a2dp|hfp|off|status${c_reset}"
+}
+
+do_connect() {
+    local kind="$1" label="$2"
+
+    info "Current status:"
+    print_status
+    echo
+
+    save_prev_defaults
+
+    if ! is_bt_connected; then
+        info "Connecting to $DEVICE_NAME..."
+        bluetoothctl connect "$MAC" >/dev/null
+        if ! wait_for 10 is_bt_connected; then
+            err "Failed to connect to $DEVICE_NAME"
+            exit 1
+        fi
+        ok "Bluetooth connected"
+    else
+        ok "Already connected"
+    fi
+
+    info "Waiting for audio card..."
+    if ! wait_for 10 card_exists; then
+        err "Audio card for $DEVICE_NAME never appeared"
+        exit 1
+    fi
+
+    local target_profile
+    target_profile=$(pick_profile "$kind")
+    if [[ -z "$target_profile" ]]; then
+        err "$DEVICE_NAME exposes no $label profile"
+        exit 1
+    fi
+
+    local current
+    current=$(active_profile)
+    if [[ "$current" == "$target_profile" ]]; then
+        ok "Already in $(profile_label "$current") mode"
+    else
+        info "Switching to $(profile_label "$target_profile")..."
+        if ! pactl set-card-profile "$CARD" "$target_profile" 2>/tmp/bt-err; then
+            err "Failed to set profile: $(cat /tmp/bt-err)"
+            exit 1
+        fi
+        sleep 1
+        local newp
+        newp=$(active_profile)
+        if [[ "$newp" == "$target_profile" ]]; then
+            ok "Now in $(profile_label "$newp") mode"
+        else
+            warn "Requested $label but device is in $(profile_label "$newp") (device/codec may not support it right now)"
+        fi
+    fi
+
+    info "Updating default output/input..."
+    local waited=0
+    while [[ -z "$(bt_sink_name)" && $waited -lt 10 ]]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    apply_audio_defaults
+
+    echo
+    info "Final status:"
+    print_status
+}
+
+do_disconnect() {
+    info "Current status:"
+    print_status
+    echo
+
+    if ! is_bt_connected; then
+        ok "Already disconnected"
+        return
+    fi
+
+    info "Disconnecting $DEVICE_NAME..."
+    bluetoothctl disconnect "$MAC" >/dev/null
+    if wait_for 10 bash -c "! bluetoothctl info '$MAC' | grep -q 'Connected: yes'"; then
+        ok "Disconnected"
+    else
+        err "Failed to disconnect"
+        exit 1
+    fi
+
+    info "Restoring default output/input..."
+    restore_audio_defaults
+
+    # bluetoothctl can briefly flicker back to "Connected: yes" right after
+    # disconnecting; let it settle before showing final status.
+    sleep 1
+
+    echo
+    info "Final status:"
+    print_status
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [<dev> [action]]
+
+With no arguments, lists known Bluetooth devices (numbered) and their state.
+
+  $(basename "$0")                    List known devices
+  $(basename "$0") <dev> a2dp|music   Connect in A2DP Sink mode (best codec)
+  $(basename "$0") <dev> hfp|call     Connect in HSP/HFP mode (best codec)
+  $(basename "$0") <dev> disconnect|off   Disconnect the device
+  $(basename "$0") <dev> status       Show connection/mode (default action)
+
+<dev> is the list number (e.g. 2), or a case-insensitive substring of the
+device name (or its MAC).
+EOF
+}
+
+# ---- dispatch ------------------------------------------------------------
+case "${1:-}" in
+    ""|list|ls|devices)
+        do_list
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        resolve_device "$1"
+        case "${2:-status}" in
+            a2dp|music)      do_connect a2dp "A2DP Sink" ;;
+            hfp|call)        do_connect hfp "HSP/HFP" ;;
+            disconnect|off)  do_disconnect ;;
+            status)          print_status ;;
+            *)               err "unknown action: $2"; echo; usage; exit 1 ;;
+        esac
+        ;;
+esac
