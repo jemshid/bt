@@ -271,6 +271,7 @@ do_connect() {
         bluetoothctl connect "$MAC" >/dev/null
         if ! wait_for 10 is_bt_connected; then
             err "Failed to connect to $DEVICE_NAME"
+            warn "The device may be powered off, out of range, or connected to another host."
             exit 1
         fi
         ok "Bluetooth connected"
