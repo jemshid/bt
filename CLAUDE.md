@@ -72,3 +72,23 @@ Key invariants:
 - `wait_for <timeout_s> <check_cmd...>` polls every 0.5s and is used
   throughout to tolerate async delays (BlueZ connect, PipeWire card
   appearing, bluez sink appearing after profile switch).
+
+## Troubleshooting
+
+- **`connect` keeps timing out though the device is paired/trusted and
+  powered on** (often while the device shows a pairing/breathing light): the
+  stored BlueZ bond is stale — the device is advertising for a *fresh* pair,
+  not a reconnect, so `bluetoothctl connect` never completes. `bt` can't fix
+  this itself; drop the old bond and re-pair while the device is discoverable:
+
+  ```bash
+  bluetoothctl remove <MAC>
+  bluetoothctl --timeout 15 scan on    # rediscover it
+  bluetoothctl pair <MAC>
+  bluetoothctl trust <MAC>
+  bluetoothctl connect <MAC>
+  bt <dev> music                       # then route audio via bt
+  ```
+
+  Note: pairing a new device can make the adapter drop an already-connected
+  one; reconnect it afterward with `bt <dev> music`.
