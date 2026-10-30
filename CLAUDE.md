@@ -59,11 +59,17 @@ The whole script (`bt`) is organized in layers, top to bottom:
   `do_connect <a2dp|hfp> <label>` (resolves the concrete profile via
   `pick_profile`), `do_disconnect`, and `print_status` compose the helpers
   above into the full command flow, each printing a "current status" /
-  progress / "final status" sequence.
+  progress / "final status" sequence. `do_clean` (`bt clean`/`prune`)
+  `bluetoothctl remove`s every known device that isn't in `bluetoothctl
+  devices Paired` — the scan-cache junk (nearby BLE advertisers, stale re-pair
+  addresses) that accumulates in the list — and warns if the adapter is still
+  `Discovering: yes`, since live advertisers get re-cached the instant they're
+  removed (blueman-applet / an open Bluetooth settings panel is the usual
+  culprit holding discovery open).
 - **Dispatch**: a `case` on `$1` at the bottom routes the no-arg/`list` form to
-  `do_list` and otherwise treats `$1` as the device query (via
-  `resolve_device`) and `$2` as the action (`a2dp`/`music`, `hfp`/`call`,
-  `disconnect`/`off`, `status`; defaulting to `status`).
+  `do_list`, `clean`/`prune` to `do_clean`, and otherwise treats `$1` as the
+  device query (via `resolve_device`) and `$2` as the action (`a2dp`/`music`,
+  `hfp`/`call`, `disconnect`/`off`, `status`; defaulting to `status`).
 
 Key invariants:
 - Mode switching (`pactl set-card-profile`) is used instead of a full

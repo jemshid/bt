@@ -5,6 +5,7 @@
 #   bt <dev> hfp|call        connect in HSP/HFP mode (best mSBC/CVSD profile)
 #   bt <dev> disconnect|off  disconnect the device
 #   bt <dev> status          show current connection/mode (default action)
+#   bt clean                 forget all cached, non-paired devices
 #
 # <dev> is the list number (e.g. 2), or a case-insensitive substring of the
 # device name (or its MAC). Works with any headset/speaker exposing standard
@@ -257,6 +258,44 @@ do_list() {
     echo "${c_dim}Control one with: $(basename "$0") <number|name> a2dp|hfp|off|status${c_reset}"
 }
 
+# Forget every known device that isn't actually paired/bonded. These are
+# cache entries BlueZ accumulates from scanning (nearby phones, trackers, BLE
+# advertisers, stale re-pair addresses) and they clutter the device list.
+do_clean() {
+    local -A paired=()
+    local mac name removed=0 kept=0
+    while read -r _ mac _; do
+        [[ -n "$mac" ]] && paired["$mac"]=1
+    done < <(bluetoothctl devices Paired 2>/dev/null)
+
+    while IFS=$'\t' read -r mac name; do
+        if [[ -n "${paired[$mac]:-}" ]]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        if bluetoothctl remove "$mac" >/dev/null 2>&1; then
+            ok "Removed ${name} (${c_dim}$mac${c_reset})"
+            removed=$((removed + 1))
+        else
+            warn "Could not remove ${name} ($mac)"
+        fi
+    done < <(list_devices)
+
+    if (( removed == 0 )); then
+        info "Nothing to clean — all $kept known device(s) are paired."
+    else
+        ok "Removed $removed cached device(s); kept $kept paired."
+    fi
+
+    # Removals won't stick while something holds a discovery session open
+    # (e.g. blueman-applet or an open Bluetooth settings panel): live
+    # advertisers get re-cached the moment they're removed.
+    if bluetoothctl show 2>/dev/null | grep -q "Discovering: yes"; then
+        warn "Adapter is still discovering; cached devices may reappear."
+        warn "Stop the scanner (Bluetooth settings panel / tray applet) to keep the list clean."
+    fi
+}
+
 do_connect() {
     local kind="$1" label="$2"
 
@@ -367,6 +406,7 @@ With no arguments, lists known Bluetooth devices (numbered) and their state.
   $(basename "$0") <dev> hfp|call     Connect in HSP/HFP mode (best codec)
   $(basename "$0") <dev> disconnect|off   Disconnect the device
   $(basename "$0") <dev> status       Show connection/mode (default action)
+  $(basename "$0") clean              Forget cached, non-paired devices
 
 <dev> is the list number (e.g. 2), or a case-insensitive substring of the
 device name (or its MAC).
@@ -377,6 +417,9 @@ EOF
 case "${1:-}" in
     ""|list|ls|devices)
         do_list
+        ;;
+    clean|prune)
+        do_clean
         ;;
     -h|--help|help)
         usage
