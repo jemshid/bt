@@ -98,3 +98,30 @@ Key invariants:
 
   Note: pairing a new device can make the adapter drop an already-connected
   one; reconnect it afterward with `bt <dev> music`.
+
+- **The device list keeps filling with junk (random-MAC BLE advertisers,
+  trackers, a *duplicate* of a real headset under a rotating address) and
+  `bt clean` removals don't stick**: something is holding the adapter in
+  active discovery, so live advertisers get re-cached the instant they're
+  removed. Confirm with `bluetoothctl show | grep Discovering` (`yes`). The
+  usual suspects are `blueman-applet` or an open Bluetooth settings panel —
+  but a **browser doing Web Bluetooth** (`navigator.bluetooth`, e.g. a Brave/
+  Chrome tab scanning for BLE devices) is a common, non-obvious cause and
+  overrides everything: killing blueman, `bluetoothctl power off/on`, and even
+  `systemctl restart bluetooth` won't stop it, because the browser re-issues
+  `StartDiscovery` the moment the adapter reappears. `bluetoothctl scan off`
+  fails with `org.bluez.Error.Failed` since the scan is owned by another
+  client, not `bt`. Find the owning process by tracing the D-Bus call:
+
+  ```bash
+  busctl monitor org.bluez          # watch for Member=StartDiscovery; note Sender=:1.N
+  busctl status :1.N                # map that unique name -> PID/Comm
+  ```
+
+  (Provoke a fresh `StartDiscovery` by cycling the adapter — `bluetoothctl
+  power off; power on` — while monitoring.) For a browser, close the scanning
+  tab or revoke its Bluetooth permission (`brave://bluetooth-internals` lists
+  the active scan's origin); for blueman, quit the applet. Once `Discovering:
+  no`, `bt clean` sticks. The clutter is purely cosmetic — it never affects
+  connecting or audio — so living with it and running `bt clean` on demand is
+  a valid option too.
