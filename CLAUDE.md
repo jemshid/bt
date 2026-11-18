@@ -55,7 +55,9 @@ The whole script (`bt`) is organized in layers, top to bottom:
   once connected (falling back to the saved non-bt source when the mode has no
   mic, e.g. A2DP). `restore_audio_defaults` puts the saved defaults back on
   disconnect and clears the state file.
-- **Actions**: `do_list` prints all known devices with a connection marker;
+- **Actions**: `do_list` prints all known devices with a connection marker
+  and, for connected devices, the current audio mode (`music`/`call`) by
+  querying the active PipeWire card profile;
   `do_connect <a2dp|hfp> <label>` (resolves the concrete profile via
   `pick_profile`), `do_disconnect`, and `print_status` compose the helpers
   above into the full command flow, each printing a "current status" /

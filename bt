@@ -248,10 +248,24 @@ do_list() {
         i=$((i + 1))
         if bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes"; then
             mark="${c_green}●${c_reset}"
+            # Show active profile mode for connected devices
+            local card="bluez_card.${mac//:/_}" prof mode=""
+            prof=$(pactl list cards 2>/dev/null | awk -v card="$card" '
+                $0 ~ "Name: " card {f=1}
+                f && /Active Profile:/ {print $3; exit}
+            ')
+            case "$prof" in
+                a2dp-sink*) mode="${c_green}music${c_reset}" ;;
+                headset-*)  mode="${c_yellow}call${c_reset}" ;;
+                *)          [[ -n "$prof" ]] && mode="${c_dim}${prof}${c_reset}" ;;
+            esac
         else
             mark="${c_dim}○${c_reset}"
+            local mode=""
         fi
-        printf '  %2d) %b %-28s %b%s%b\n' "$i" "$mark" "$name" "$c_dim" "$mac" "$c_reset"
+        printf '  %2d) %b %-28s %b%s%b' "$i" "$mark" "$name" "$c_dim" "$mac" "$c_reset"
+        [[ -n "$mode" ]] && printf '  %b' "$mode"
+        echo
     done < <(list_devices)
     (( i )) || warn "No paired/known devices. Pair one first with: bluetoothctl"
     echo
